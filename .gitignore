@@ -1,0 +1,4 @@
+node_modules/
+
+# Scraper-Ergebnis: wird nach gh-pages veröffentlicht, nicht in die History
+data/

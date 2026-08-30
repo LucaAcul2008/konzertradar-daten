@@ -1,0 +1,13 @@
+{
+  "name": "konzertradar-scraper",
+  "version": "2.0.0",
+  "description": "Holt Konzerte über die Eventim-Such-API und legt sie als JSON ab",
+  "main": "scrape.js",
+  "scripts": {
+    "start": "node scrape.js"
+  },
+  "license": "ISC",
+  "dependencies": {
+    "puppeteer": "^25.9.0"
+  }
+}

@@ -1,0 +1,96 @@
+name: Konzerte scrapen (Eventim API)
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # Alle 6 Stunden
+  workflow_dispatch:          # Manueller Start jederzeit möglich
+
+# Verhindert, dass sich zwei Läufe überschneiden
+concurrency:
+  group: scrape-concerts
+  cancel-in-progress: false
+
+permissions:
+  contents: write             # zum Zurückcommitten der Daten
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    # Ein normaler Lauf dauert ~8 min. Das Job-Limit ist die letzte Reißleine;
+    # die Schritte haben zusätzlich eigene Zeitlimits, damit ein hängender
+    # Schritt nicht die gesamte Zeit verbrennt.
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Node.js einrichten
+        uses: actions/setup-node@v5
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: github_scraper/package-lock.json
+
+      # Puppeteer legt Chrome außerhalb von node_modules ab — der npm-Cache
+      # erfasst ihn nicht, jeder Lauf lud sonst ~150 MB neu. Genau dort blieben
+      # die Läufe hängen, die ins 45-Minuten-Limit gelaufen sind.
+      - name: Chrome zwischenspeichern
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/puppeteer
+          key: puppeteer-${{ runner.os }}-${{ hashFiles('github_scraper/package-lock.json') }}
+
+      - name: Abhängigkeiten installieren
+        working-directory: github_scraper
+        timeout-minutes: 6
+        run: npm ci
+
+      - name: Konzerte über die Eventim-API holen
+        working-directory: github_scraper
+        timeout-minutes: 20
+        env:
+          # Daten des letzten Laufs — daraus werden neu angekündigte Konzerte
+          # für den "Bald erhältlich"-Tab ermittelt.
+          PAGES_URL: https://lucaacul2008.github.io/konzertradar-daten
+        run: node scrape.js
+
+      - name: Ergebnis prüfen
+        run: |
+          set -e
+          test -s data/eventim_de.json
+          test -s data/oeticket_at.json
+          node -e "
+            const de = require('./data/eventim_de.json');
+            const at = require('./data/oeticket_at.json');
+            console.log('DE:', de.length, '| AT:', at.length);
+            if (de.length < 1000 || at.length < 300) {
+              console.error('Zu wenige Konzerte — Scraping vermutlich defekt');
+              process.exit(1);
+            }
+          "
+
+      # Nur der Geo-Cache wandert ins Repo — er wächst langsam und spart bei
+      # jedem Lauf Nominatim-Anfragen. Die Konzertdaten selbst kommen NICHT in
+      # die History (13 MB alle 6 Stunden), sondern nur nach gh-pages.
+      - name: Geo-Cache committen
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add github_scraper/geo_cache.json
+          if git diff --staged --quiet; then
+            echo "Keine Änderungen am Geo-Cache"
+          else
+            git commit -m "Geo-Cache aktualisiert ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git push
+          fi
+
+      # force_orphan verwirft die alte gh-pages-History bei jedem Lauf — sonst
+      # würde der Branch mit jedem Datensatz um mehrere MB wachsen.
+      - name: GitHub Pages veröffentlichen
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./data
+          publish_branch: gh-pages
+          force_orphan: true
