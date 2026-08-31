@@ -305,8 +305,9 @@ function baueUrl(quelle, params) {
 function mapProdukt(p, quelle) {
   const le = p.typeAttributes?.liveEntertainment;
   if (!le) return null;
-  // Abgesagte Veranstaltungen gehören nicht in die App
-  if (p.status === 'Cancelled') return null;
+  // Abgesagte und ausverkaufte Veranstaltungen gehören nicht in die App.
+  // Die API kennt genau drei Werte: Available, SoldOut, Cancelled.
+  if (p.status === 'Cancelled' || p.status === 'SoldOut') return null;
   // Ticket-Zusatzpakete sind Dubletten des eigentlichen Konzerts
   if (istZusatzpaket(p.name)) return null;
   // Das Monatsfenster beginnt am Monatsersten — bereits gelaufene Termine
