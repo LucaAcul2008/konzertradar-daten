@@ -151,6 +151,29 @@ function kandidat(roh) {
 }
 
 /**
+ * Ausweichnamen, falls der volle Name nirgends bekannt ist.
+ *
+ * Doppel-Headliner und Begleitbands stehen mit "&" oder "und" im Titel:
+ * "Pizzera & Jaus & folkshilfe" (18 Konzerte), "Clueso & SWR Big Band",
+ * "Gitte Haenning & Band: Ich bin Stark" (15 Konzerte). Als Ganzes kennt die
+ * niemand, der erste Teil dagegen schon.
+ *
+ * Deshalb von hinten kürzen statt am ersten "&" zu trennen: "Simon &
+ * Garfunkel" und "dicht & ergreifend" heissen wirklich so und werden zuerst
+ * am Stück versucht — erst wenn das nichts findet, wird gekürzt.
+ */
+function alternativen(name) {
+  const teile = name.split(/\s+(?:&|und)\s+/i);
+  if (teile.length < 2) return [];
+  const raus = [];
+  for (let i = teile.length - 1; i >= 1; i--) {
+    const kurz = teile.slice(0, i).join(' & ').trim();
+    if (kurz.length >= 2 && kurz !== name) raus.push(kurz);
+  }
+  return raus.slice(0, 3);
+}
+
+/**
  * Vergleichsform eines Namens.
  *
  * Achtung, sieht nach einem Fehler aus, ist aber Absicht: Hier wird "ä" zu
@@ -315,6 +338,21 @@ function ladeCache() {
     console.error('[Künstler] Cache-Ladefehler:', e.message);
   }
 }
+/**
+ * Der Treffer zu einem Eintrag — erst der volle Name, dann die Ausweichnamen.
+ *
+ * Gibt den Datensatz zurück, oder undefined wenn noch keiner der Namen einen
+ * Treffer hatte.
+ */
+function trefferZu(schluessel, e) {
+  if (cache[schluessel]) return cache[schluessel];
+  for (const a of e.alt || []) {
+    const t = cache[normalisiere(a)];
+    if (t) return t;
+  }
+  return undefined;
+}
+
 function speichereCache() {
   try {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 0));
@@ -349,7 +387,8 @@ async function main() {
       if (!kand) continue;
       const schluessel = normalisiere(kand);
       if (!schluessel) continue;
-      const e = roh.get(schluessel) || { anzahl: 0, bild: null, roh: kand };
+      const e = roh.get(schluessel) ||
+        { anzahl: 0, bild: null, roh: kand, alt: alternativen(kand) };
       e.anzahl++;
       // Das Bild aus dem Konzertdatensatz — Eventim und oeticket liefern es
       // ohnehin mit. Ein fremder Bilderdienst erübrigt sich damit, und die
@@ -370,7 +409,7 @@ async function main() {
   // Ende schlecht, MusicBrainz soll sie danach trotzdem noch bekommen. Der
   // ganze Durchgang kostet nur gut zwei Minuten, ein Cache dafür lohnt nicht.
   const wdOffen = [...roh.entries()]
-    .filter(([s, e]) => cache[s] === undefined && e.anzahl >= MIN_KONZERTE)
+    .filter(([s, e]) => cache[s] === undefined && !trefferZu(s, e) && e.anzahl >= MIN_KONZERTE)
     .sort((a, b) => b[1].anzahl - a[1].anzahl);
 
   if (wdOffen.length > 0) {
@@ -384,7 +423,16 @@ async function main() {
         break;
       }
       const teil = wdOffen.slice(i, i + WD_PRO_STAPEL);
-      const treffer = await wikidataStapel(teil.map(([, e]) => e.roh));
+
+      // Ausweichnamen kommen mit in denselben Stapel — bei Wikidata kostet ein
+      // Name mehr in der Anfrage praktisch nichts, eine zweite Runde dagegen
+      // schon.
+      const zuFragen = [];
+      for (const [, e] of teil) {
+        zuFragen.push(e.roh);
+        for (const a of e.alt || []) zuFragen.push(a);
+      }
+      const treffer = await wikidataStapel([...new Set(zuFragen)]);
 
       if (treffer === undefined) {
         // Technischer Fehler: Stapel überspringen, nicht als "nichts" werten
@@ -397,9 +445,21 @@ async function main() {
       wdFehler = 0;
 
       for (const [schluessel, e] of teil) {
-        const name = treffer.get(e.roh);
-        if (!name) continue; // MusicBrainz bekommt ihn später
-        cache[schluessel] = { name, land: null, quelle: 'wikidata' };
+        const voll = treffer.get(e.roh);
+        if (voll) {
+          cache[schluessel] = { name: voll, land: null, quelle: 'wikidata' };
+          wdGefunden++;
+          continue;
+        }
+        // Kein Treffer auf den vollen Namen — die Ausweichnamen probieren
+        let ersatz = null;
+        for (const a of e.alt || []) {
+          const t = treffer.get(a);
+          if (t) { ersatz = [a, t]; break; }
+        }
+        if (!ersatz) continue; // MusicBrainz bekommt ihn später
+        cache[normalisiere(ersatz[0])] =
+          { name: ersatz[1], land: null, quelle: 'wikidata' };
         wdGefunden++;
       }
 
@@ -417,7 +477,7 @@ async function main() {
   // Offene Namen nach Konzertzahl: die bekanntesten zuerst, damit die Datei
   // schon nach dem ersten Lauf brauchbar ist.
   const offen = [...roh.entries()]
-    .filter(([s, e]) => cache[s] === undefined && e.anzahl >= MIN_KONZERTE)
+    .filter(([s, e]) => cache[s] === undefined && !trefferZu(s, e) && e.anzahl >= MIN_KONZERTE)
     .sort((a, b) => b[1].anzahl - a[1].anzahl)
     .slice(0, MAX_MB_PRO_LAUF);
 
@@ -471,22 +531,38 @@ async function main() {
   }
   if (offen.length > 0) speichereCache();
 
-  // Datei bauen: nur bestätigte Künstler, mit kanonischer Schreibweise
-  const liste = [];
+  // Datei bauen: nur bestätigte Künstler, mit kanonischer Schreibweise.
+  //
+  // Zusammengefasst wird über den kanonischen Namen, nicht über den Rohtitel:
+  // "Ina Müller und Band", "Ina Müller - Die 6.0 Tour" und "Ina Müller" sind
+  // derselbe Mensch und müssen als ein Eintrag mit der Summe ihrer Konzerte
+  // erscheinen, sonst steht sie dreimal in der Liste.
+  const zusammen = new Map();
   for (const [schluessel, e] of roh) {
-    const mb = cache[schluessel];
-    if (!mb) continue; // unbekannt oder noch nicht nachgeschlagen
-    // Die MusicBrainz-ID steht bewusst NICHT in der ausgelieferten Datei: Die
-    // App braucht sie nicht, und 36 Zeichen mal ~6000 Künstler sind gut 200 kB,
-    // die jedes Gerät sonst mitlädt. Im Cache hier im Repo bleibt sie
-    // erhalten, falls sie später gebraucht wird.
-    liste.push({
-      n: mb.name,          // kanonischer Name von MusicBrainz
-      k: e.anzahl,         // angekündigte Konzerte
-      b: e.bild || undefined,
-      l: mb.land || undefined,
-    });
+    const treffer = trefferZu(schluessel, e);
+    if (!treffer) continue; // unbekannt oder noch nicht nachgeschlagen
+
+    const key = normalisiere(treffer.name);
+    const vorhanden = zusammen.get(key);
+    if (vorhanden) {
+      vorhanden.k += e.anzahl;
+      if (!vorhanden.b && e.bild) vorhanden.b = e.bild;
+      if (!vorhanden.l && treffer.land) vorhanden.l = treffer.land;
+    } else {
+      // Die MusicBrainz-ID steht bewusst NICHT in der ausgelieferten Datei:
+      // Die App braucht sie nicht, und 36 Zeichen mal mehrere tausend Künstler
+      // sind gut 200 kB, die jedes Gerät sonst mitlädt. Im Cache hier im Repo
+      // bleibt sie erhalten, falls sie später gebraucht wird.
+      zusammen.set(key, {
+        n: treffer.name,      // kanonische Schreibweise der Quelle
+        k: e.anzahl,          // angekündigte Konzerte
+        b: e.bild || undefined,
+        l: treffer.land || undefined,
+      });
+    }
   }
+
+  const liste = [...zusammen.values()];
   liste.sort((a, b) => b.k - a.k || a.n.localeCompare(b.n));
 
   const ausgabe = {
