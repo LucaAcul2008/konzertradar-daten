@@ -16,10 +16,11 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-    # Ein normaler Lauf dauert ~8 min. Das Job-Limit ist die letzte Reißleine;
-    # die Schritte haben zusätzlich eigene Zeitlimits, damit ein hängender
-    # Schritt nicht die gesamte Zeit verbrennt.
-    timeout-minutes: 25
+    # Scrapen dauert ~8 min, der Künstlerindex kommt mit bis zu 14 min dazu.
+    # Das Job-Limit ist die letzte Reißleine; die Schritte haben zusätzlich
+    # eigene Zeitlimits, damit ein hängender Schritt nicht die gesamte Zeit
+    # verbrennt.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -70,18 +71,45 @@ jobs:
             }
           "
 
-      # Nur der Geo-Cache wandert ins Repo — er wächst langsam und spart bei
-      # jedem Lauf Nominatim-Anfragen. Die Konzertdaten selbst kommen NICHT in
-      # die History (13 MB alle 6 Stunden), sondern nur nach gh-pages.
-      - name: Geo-Cache committen
+      # Künstlerindex: löst die Veranstaltungstitel gegen MusicBrainz zu echten
+      # Künstlernamen auf und schreibt data/kuenstler.json. Muss nach dem
+      # Scrapen laufen, es liest die frisch erzeugten Konzertdateien.
+      #
+      # continue-on-error: Schlägt der Schritt fehl, sollen die Konzerte
+      # trotzdem veröffentlicht werden. Die App kommt notfalls ohne den Index
+      # aus (dann sucht sie wie bisher im Katalog), aber nicht ohne Konzerte.
+      - name: Künstlerindex bauen
+        working-directory: github_scraper
+        timeout-minutes: 18
+        continue-on-error: true
+        env:
+          # Das Zeitbudget ist der eigentliche Deckel: MusicBrainz wirft global
+          # Last ab, ein Name dauerte gemessen zwischen 2,2 s und 6,6 s. Eine
+          # feste Namenszahl träfe die Laufzeit deshalb nicht — das Skript
+          # steigt nach 14 Minuten von sich aus aus und schreibt die Datei
+          # noch. Die Namenszahl ist nur die Obergrenze für einen guten Tag.
+          #
+          # Je nach Tempo sind das 130 bis 380 Namen pro Lauf, bei vier Läufen
+          # am Tag also gut 500 bis 1500. Der Rückstand von ~10.400 Kandidaten
+          # ist damit in ein bis drei Wochen abgearbeitet; danach fallen nur
+          # noch die paar neu angekündigten Künstler an.
+          MAX_MINUTEN: '14'
+          MAX_MUSICBRAINZ: '400'
+        run: node kuenstler_index.js
+
+      # Nur die Caches wandern ins Repo — sie wachsen langsam und sparen bei
+      # jedem Lauf Anfragen an Nominatim bzw. MusicBrainz. Die Konzertdaten
+      # selbst kommen NICHT in die History (13 MB alle 6 Stunden), sondern nur
+      # nach gh-pages.
+      - name: Caches committen
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add github_scraper/geo_cache.json
+          git add github_scraper/geo_cache.json github_scraper/kuenstler_cache.json
           if git diff --staged --quiet; then
-            echo "Keine Änderungen am Geo-Cache"
+            echo "Keine Änderungen an den Caches"
           else
-            git commit -m "Geo-Cache aktualisiert ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+            git commit -m "Caches aktualisiert ($(date -u '+%Y-%m-%d %H:%M UTC'))"
             git push
           fi
 
