@@ -351,12 +351,15 @@ async function main() {
   for (const [schluessel, e] of roh) {
     const mb = cache[schluessel];
     if (!mb) continue; // unbekannt oder noch nicht nachgeschlagen
+    // Die MusicBrainz-ID steht bewusst NICHT in der ausgelieferten Datei: Die
+    // App braucht sie nicht, und 36 Zeichen mal ~6000 Künstler sind gut 200 kB,
+    // die jedes Gerät sonst mitlädt. Im Cache hier im Repo bleibt sie
+    // erhalten, falls sie später gebraucht wird.
     liste.push({
       n: mb.name,          // kanonischer Name von MusicBrainz
       k: e.anzahl,         // angekündigte Konzerte
       b: e.bild || undefined,
       l: mb.land || undefined,
-      m: mb.mbid,
     });
   }
   liste.sort((a, b) => b.k - a.k || a.n.localeCompare(b.n));
