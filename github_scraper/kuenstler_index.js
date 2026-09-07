@@ -226,7 +226,77 @@ async function musicbrainz(name) {
     passend.sort((a, b) => heim(a) - heim(b) || (b.score || 0) - (a.score || 0));
 
     const a = passend[0];
-    return { mbid: a.id, name: a.name, land: a.country || null };
+    return {
+      mbid: a.id,
+      name: a.name,
+      land: a.country || null,
+      quelle: 'musicbrainz',
+    };
+  } catch (_) {
+    return undefined;
+  }
+}
+
+// ─── Wikidata: der schnelle Durchgang ─────────────────────────────────────────
+
+// MusicBrainz beantwortet eine Anfrage pro Sekunde und damit einen Namen nach
+// dem anderen — die 10.400 Kandidaten wären 6 bis 19 Stunden. Wikidata nimmt
+// per SPARQL hundert Namen auf einmal und ist in gut zwei Minuten durch den
+// ganzen Katalog. Ebenfalls CC0, also unter denselben Bedingungen nutzbar.
+//
+// Wikidata kennt weniger Künstler als MusicBrainz, vor allem im langen Ende.
+// Deshalb nur der erste Durchgang: Was hier durchfällt, geht danach den
+// langsamen Weg über MusicBrainz.
+const WIKIDATA = 'https://query.wikidata.org/sparql';
+const WD_PRO_STAPEL = parseInt(process.env.WD_STAPEL || '100', 10);
+
+/**
+ * Fragt einen Stapel Namen bei Wikidata ab.
+ *
+ * Gibt eine Map Name -> kanonische Schreibweise zurück; undefined bei einem
+ * technischen Fehler, damit der Aufrufer den Stapel nicht als "nichts
+ * gefunden" verbucht.
+ */
+async function wikidataStapel(namen) {
+  // Die Label-Literale in Wikidata sind sprachmarkiert — ein Vergleich ohne
+  // Sprachtag findet grundsätzlich nichts. "mul" ist der neuere Code für
+  // sprachübergreifende Namen, den viele Bands inzwischen tragen.
+  const werte = namen
+    .flatMap((n) => ['de', 'en', 'mul'].map((t) => `"${n.replace(/["\\]/g, '')}"@${t}`))
+    .join(' ');
+
+  // Zwei Fälle, die beide zählen: Bands (eine Art musikalische Gruppe) und
+  // Menschen mit einem Musikberuf. Ohne den zweiten fehlten alle Solisten —
+  // Hubert von Goisern und Matthias Reim fielen im Test glatt durch.
+  const query = `SELECT ?name ?item ?itemLabel WHERE {
+  VALUES ?name { ${werte} }
+  ?item rdfs:label|skos:altLabel ?name .
+  { ?item wdt:P31/wdt:P279* wd:Q215380 }
+  UNION
+  { ?item wdt:P31 wd:Q5 ; wdt:P106 ?beruf .
+    VALUES ?beruf { wd:Q639669 wd:Q177220 wd:Q36834 wd:Q488205 wd:Q753110 wd:Q855091 wd:Q486748 } }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "de,en". }
+}`;
+
+  try {
+    const res = await fetch(WIKIDATA, {
+      method: 'POST',
+      headers: {
+        'User-Agent': USER_AGENT,
+        Accept: 'application/sparql-results+json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ query }),
+      signal: AbortSignal.timeout(90000),
+    });
+    if (!res.ok) return undefined;
+    const j = await res.json();
+    const treffer = new Map();
+    for (const r of j.results.bindings) {
+      const gesucht = r.name.value;
+      if (!treffer.has(gesucht)) treffer.set(gesucht, r.itemLabel.value);
+    }
+    return treffer;
   } catch (_) {
     return undefined;
   }
@@ -256,6 +326,11 @@ function speichereCache() {
 // ─── Lauf ─────────────────────────────────────────────────────────────────────
 
 async function main() {
+  // Das Zeitbudget gilt für den ganzen Lauf, beide Durchgänge zusammen —
+  // sonst käme die Wikidata-Zeit oben drauf und der Schritt liefe doch ins
+  // Zeitlimit der Action.
+  const schluss = Date.now() + MAX_MINUTEN * 60 * 1000;
+
   ladeCache();
 
   // Rohtitel einsammeln, dabei je Künstler ein Bild und die Konzertzahl merken
@@ -288,6 +363,57 @@ async function main() {
     `[Künstler] ${konzerteGesamt} Konzerte -> ${roh.size} Namenskandidaten`
   );
 
+  // ── Erster Durchgang: Wikidata, stapelweise ──────────────────────────────
+  //
+  // Läuft bei jedem Mal über alle noch offenen Namen. Fehltreffer werden
+  // absichtlich NICHT als "kein Künstler" gemerkt: Wikidata kennt das lange
+  // Ende schlecht, MusicBrainz soll sie danach trotzdem noch bekommen. Der
+  // ganze Durchgang kostet nur gut zwei Minuten, ein Cache dafür lohnt nicht.
+  const wdOffen = [...roh.entries()]
+    .filter(([s, e]) => cache[s] === undefined && e.anzahl >= MIN_KONZERTE)
+    .sort((a, b) => b[1].anzahl - a[1].anzahl);
+
+  if (wdOffen.length > 0) {
+    console.log(`[Künstler] Wikidata: ${wdOffen.length} Namen in Stapeln zu ${WD_PRO_STAPEL}`);
+    let wdGefunden = 0;
+    let wdFehler = 0;
+
+    for (let i = 0; i < wdOffen.length; i += WD_PRO_STAPEL) {
+      if (Date.now() > schluss) {
+        console.log('[Künstler] Wikidata: Zeitbudget erreicht, Rest beim nächsten Lauf');
+        break;
+      }
+      const teil = wdOffen.slice(i, i + WD_PRO_STAPEL);
+      const treffer = await wikidataStapel(teil.map(([, e]) => e.roh));
+
+      if (treffer === undefined) {
+        // Technischer Fehler: Stapel überspringen, nicht als "nichts" werten
+        if (++wdFehler >= 5) {
+          console.warn('[Künstler] Wikidata antwortet nicht — Durchgang abgebrochen');
+          break;
+        }
+        continue;
+      }
+      wdFehler = 0;
+
+      for (const [schluessel, e] of teil) {
+        const name = treffer.get(e.roh);
+        if (!name) continue; // MusicBrainz bekommt ihn später
+        cache[schluessel] = { name, land: null, quelle: 'wikidata' };
+        wdGefunden++;
+      }
+
+      if ((i / WD_PRO_STAPEL) % 10 === 9) {
+        console.log(`[Künstler] Wikidata ${i + teil.length}/${wdOffen.length}, ${wdGefunden} erkannt`);
+      }
+    }
+
+    console.log(`[Künstler] Wikidata: ${wdGefunden} Künstler erkannt`);
+    if (wdGefunden > 0) speichereCache();
+  }
+
+  // ── Zweiter Durchgang: MusicBrainz, Name für Name ────────────────────────
+  //
   // Offene Namen nach Konzertzahl: die bekanntesten zuerst, damit die Datei
   // schon nach dem ersten Lauf brauchbar ist.
   const offen = [...roh.entries()]
@@ -295,13 +421,12 @@ async function main() {
     .sort((a, b) => b[1].anzahl - a[1].anzahl)
     .slice(0, MAX_MB_PRO_LAUF);
 
-  console.log(`[Künstler] ${offen.length} neue Namen werden nachgeschlagen`);
+  console.log(`[Künstler] MusicBrainz: ${offen.length} weitere Namen`);
 
   let gefunden = 0;
   let fehlerInFolge = 0;
   let seitLetzterSicherung = 0;
   let versucht = 0;
-  const schluss = Date.now() + MAX_MINUTEN * 60 * 1000;
   for (const [schluessel, e] of offen) {
     if (Date.now() > schluss) {
       console.log(
