@@ -412,8 +412,28 @@ async function main() {
       const schluessel = normalisiere(kand);
       if (!schluessel) continue;
       const e = roh.get(schluessel) ||
-        { anzahl: 0, bild: null, roh: kand, alt: alternativen(kand) };
-      e.anzahl++;
+        { anzahl: 0, bild: null, roh: kand, alt: alternativen(kand), tage: new Set() };
+
+      // Nach Tag und Ort zählen, nicht nach Zeilen.
+      //
+      // Eventim führt dasselbe Konzert unter mehreren Produkten: Provinz stand
+      // fünfmal am 18. Juli 2027 in der Clam Burgarena — als "Caravan", als
+      // "Burg Clam" und mit weiteren Zusätzen. Gezählt ergab das "5
+      // angekündigte Konzerte", während die App danach genau einen Termin
+      // anzeigte. Zwei Zahlen für dieselbe Sache, und beide sahen falsch aus.
+      // Achtung: Set.add() gibt in JavaScript das Set zurück, nicht wie in
+      // Dart einen Wahrheitswert. "if (set.add(x))" wäre deshalb immer wahr.
+      // Nach Tag und ORT, nicht nach Halle: Dieselbe Bühne steht mal als
+      // "Burg Clam", mal als "Clam Burgarena" in den Daten. Nach Halle
+      // gezählt wären das zwei Konzerte, die App zeigt aber eines. Der
+      // Scraper fasst an anderer Stelle genauso zusammen (dublettenKey).
+      const tag = (k.datum || '').slice(0, 10);
+      const wann = `${tag}|${(k.ort || '').toLowerCase()}`;
+      if (!e.tage.has(wann)) {
+        e.tage.add(wann);
+        e.anzahl++;
+      }
+
       // Das Bild aus dem Konzertdatensatz — Eventim und oeticket liefern es
       // ohnehin mit. Ein fremder Bilderdienst erübrigt sich damit, und die
       // Rechtefrage stellt sich nicht neu.
