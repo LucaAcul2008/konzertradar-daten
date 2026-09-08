@@ -36,6 +36,7 @@ const path = require('path');
 
 const DATA_DIR = path.join(__dirname, '..', 'data');
 const CACHE_FILE = path.join(__dirname, 'kuenstler_cache.json');
+const WD_FEHLSCHLAG_FILE = path.join(__dirname, 'wikidata_schonfrist.json');
 const OUT_FILE = path.join(DATA_DIR, 'kuenstler.json');
 
 // MusicBrainz verlangt eine aussagekräftige Kennung mit Kontaktadresse —
@@ -328,6 +329,14 @@ async function wikidataStapel(namen) {
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
 let cache = {};
+
+/// Wann Wikidata einen Namen zuletzt nicht kannte (Schlüssel -> Zeitstempel).
+///
+/// Bewusst eine eigene Datei: Im Künstler-Cache stehen Ergebnisse, hier nur
+/// eine Merkhilfe fürs Nachfragen. Vermischt wäre beides schwerer zu lesen und
+/// ein Fehler in der einen Hälfte risse die andere mit.
+let wdFehlschlag = {};
+
 function ladeCache() {
   try {
     if (fs.existsSync(CACHE_FILE)) {
@@ -336,6 +345,16 @@ function ladeCache() {
     }
   } catch (e) {
     console.error('[Künstler] Cache-Ladefehler:', e.message);
+  }
+  try {
+    if (fs.existsSync(WD_FEHLSCHLAG_FILE)) {
+      wdFehlschlag = JSON.parse(fs.readFileSync(WD_FEHLSCHLAG_FILE, 'utf8'));
+      console.log(
+        `[Künstler] ${Object.keys(wdFehlschlag).length} Namen mit Wikidata-Schonfrist`
+      );
+    }
+  } catch (e) {
+    console.error('[Künstler] Schonfrist-Ladefehler:', e.message);
   }
 }
 /**
@@ -358,6 +377,11 @@ function speichereCache() {
     fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 0));
   } catch (e) {
     console.error('[Künstler] Cache-Speicherfehler:', e.message);
+  }
+  try {
+    fs.writeFileSync(WD_FEHLSCHLAG_FILE, JSON.stringify(wdFehlschlag, null, 0));
+  } catch (e) {
+    console.error('[Künstler] Schonfrist-Speicherfehler:', e.message);
   }
 }
 
@@ -408,8 +432,25 @@ async function main() {
   // absichtlich NICHT als "kein Künstler" gemerkt: Wikidata kennt das lange
   // Ende schlecht, MusicBrainz soll sie danach trotzdem noch bekommen. Der
   // ganze Durchgang kostet nur gut zwei Minuten, ein Cache dafür lohnt nicht.
+  // Namen, die Wikidata schon einmal nicht kannte, kommen erst nach einer
+  // Schonfrist wieder dran.
+  //
+  // Gemessen am 8.9.2026: Von 7403 erneut gefragten Namen kam genau EINER neu
+  // dazu. Wikidata kennt das lange Ende schlicht nicht, und die Abfrage kostet
+  // jedes Mal mehrere Minuten aus dem Zeitbudget — Minuten, die MusicBrainz
+  // fehlen, wo die Trefferquote bei über 50 Prozent liegt. Ganz aufgeben will
+  // man sie nicht: Wikidata wächst, nur eben nicht im Sechs-Stunden-Takt.
+  const WD_SCHONFRIST_TAGE = parseFloat(process.env.WD_SCHONFRIST || '30');
+  const jetzt = Date.now();
+  const schonfrist = WD_SCHONFRIST_TAGE * 24 * 60 * 60 * 1000;
+
   const wdOffen = [...roh.entries()]
-    .filter(([s, e]) => cache[s] === undefined && !trefferZu(s, e) && e.anzahl >= MIN_KONZERTE)
+    .filter(([s, e]) => {
+      if (cache[s] !== undefined || trefferZu(s, e)) return false;
+      if (e.anzahl < MIN_KONZERTE) return false;
+      const zuletzt = wdFehlschlag[s];
+      return zuletzt === undefined || jetzt - zuletzt > schonfrist;
+    })
     .sort((a, b) => b[1].anzahl - a[1].anzahl);
 
   if (wdOffen.length > 0) {
@@ -457,7 +498,12 @@ async function main() {
           const t = treffer.get(a);
           if (t) { ersatz = [a, t]; break; }
         }
-        if (!ersatz) continue; // MusicBrainz bekommt ihn später
+        if (!ersatz) {
+          // Wikidata kennt ihn nicht. Datum merken, damit der nächste Lauf
+          // ihn nicht sofort wieder fragt — MusicBrainz bekommt ihn ohnehin.
+          wdFehlschlag[schluessel] = Date.now();
+          continue;
+        }
         cache[normalisiere(ersatz[0])] =
           { name: ersatz[1], land: null, quelle: 'wikidata' };
         wdGefunden++;
@@ -469,7 +515,10 @@ async function main() {
     }
 
     console.log(`[Künstler] Wikidata: ${wdGefunden} Künstler erkannt`);
-    if (wdGefunden > 0) speichereCache();
+    // Auch sichern, wenn nichts gefunden wurde: Gerade dann sind die
+    // Fehlschlag-Vermerke entstanden, und ohne sie fragt der nächste Lauf
+    // dieselben aussichtslosen Namen wieder.
+    speichereCache();
   }
 
   // ── Zweiter Durchgang: MusicBrainz, Name für Name ────────────────────────
