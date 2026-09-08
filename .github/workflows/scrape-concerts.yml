@@ -25,6 +25,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # Standard wäre ein verkürzter Klon mit einem einzigen Commit. Darauf
+          # kann der Rebase im Cache-Schritt nicht arbeiten, wenn jemand
+          # während des Laufs ins Repo geschoben hat. Das Repo hat 24 Commits
+          # und keine Datendateien in der History — die volle Historie kostet
+          # hier nichts.
+          fetch-depth: 0
 
       - name: Node.js einrichten
         uses: actions/setup-node@v5
@@ -101,17 +108,39 @@ jobs:
       # jedem Lauf Anfragen an Nominatim bzw. MusicBrainz. Die Konzertdaten
       # selbst kommen NICHT in die History (13 MB alle 6 Stunden), sondern nur
       # nach gh-pages.
+      # continue-on-error, und das ist der Kern der Sache: Der Cache ist eine
+      # Bequemlichkeit, das Veröffentlichen der Konzertdaten die eigentliche
+      # Aufgabe. Am 7.9.2026 scheiterte hier ein Push (jemand hatte während des
+      # Laufs ins Repo geschoben), der Job brach mit Fehler ab — und der
+      # Veröffentlichungsschritt danach lief nie. Die Nebensache hat die
+      # Hauptsache verhindert. Das darf nicht noch einmal passieren.
       - name: Caches committen
+        continue-on-error: true
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add github_scraper/geo_cache.json github_scraper/kuenstler_cache.json
+
           if git diff --staged --quiet; then
             echo "Keine Änderungen an den Caches"
-          else
-            git commit -m "Caches aktualisiert ($(date -u '+%Y-%m-%d %H:%M UTC'))"
-            git push
+            exit 0
           fi
+
+          git commit -m "Caches aktualisiert ($(date -u '+%Y-%m-%d %H:%M UTC'))"
+
+          # Ein Lauf dauert über 20 Minuten. In dieser Zeit kann jemand ins
+          # Repo geschoben haben, dann ist der lokale Stand veraltet und der
+          # Push wird abgelehnt. Vorher rebasen statt blind zu drücken; die
+          # Caches sind reine Anhängsel, ein Rebase kann sie nicht verfälschen.
+          for versuch in 1 2 3; do
+            if git push; then
+              echo "Caches gepusht"
+              exit 0
+            fi
+            echo "Push abgelehnt — hole den neuen Stand (Versuch $versuch)"
+            git pull --rebase origin main || break
+          done
+          echo "Cache-Push aufgegeben — die Daten werden trotzdem veröffentlicht"
 
       # force_orphan verwirft die alte gh-pages-History bei jedem Lauf — sonst
       # würde der Branch mit jedem Datensatz um mehrere MB wachsen.

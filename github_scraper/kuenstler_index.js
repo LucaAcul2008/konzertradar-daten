@@ -567,7 +567,9 @@ async function main() {
 
   const ausgabe = {
     aktualisiert: new Date().toISOString(),
-    quelle: 'MusicBrainz (CC0)',
+    // Beide Quellen nennen, nicht nur eine: Der Grossteil der Namen kommt
+    // inzwischen aus dem schnellen Wikidata-Durchgang, nicht aus MusicBrainz.
+    quelle: 'Wikidata und MusicBrainz (CC0)',
     anzahl: liste.length,
     kuenstler: liste,
   };
