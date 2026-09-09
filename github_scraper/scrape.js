@@ -27,9 +27,18 @@ const GEO_CACHE_FILE = path.join(__dirname, 'geo_cache.json');
 const PAGES_URL = process.env.PAGES_URL || '';
 
 const PAGE_SIZE = 100;
-// 12 Monate decken praktisch alle relevanten Konzerte ab und halten die
-// Länderdatei bei ~2 MB gzip. Mehr geht per Env-Variable.
-const MONATE_VORAUS = parseInt(process.env.MONATE_VORAUS || '12', 10);
+// 24 Monate, nicht 12.
+//
+// Gemessen am 09.09.2026 gegen die API: In den Monaten 1-12 liegen 31.845
+// (DE) und 6.141 (AT) Konzerte, in den Monaten 13-24 noch einmal 1.517 und
+// 368 — rund fünf Prozent mehr. Jenseits von 24 Monaten ist praktisch
+// nichts mehr da (11 beziehungsweise 0), deshalb endet es hier.
+//
+// Diese 1.885 sind nicht irgendwelche: Es sind die Touren, die weit im
+// Voraus angekündigt werden. Genau bei denen zählt es, früh Bescheid zu
+// wissen. Die Monate sind dünn besetzt, der Lauf wird dadurch nur um
+// wenige Seitenabrufe länger.
+const MONATE_VORAUS = parseInt(process.env.MONATE_VORAUS || '24', 10);
 // Zeitraum der Standarddatei, die die App beim Start lädt.
 const MONATE_STANDARD = parseInt(process.env.MONATE_STANDARD || '6', 10);
 // Für lokale Tests: MAX_MONATE=1 node scrape.js
@@ -485,13 +494,28 @@ async function ladeBekannteIds() {
   }
 }
 
+// Weiter als ein Jahr voraus gilt nichts mehr als "neu angekündigt".
+//
+// Zwei Gründe. Erstens ist der Tab "Bald verfügbar" eine Sache der nächsten
+// Monate — ein Konzert in zwei Jahren gehört dort nicht hin. Zweitens, und
+// das war der Anlass: Als das Fenster von 12 auf 24 Monate erweitert wurde,
+// tauchten rund 1.900 Konzerte zum ersten Mal auf. Alle galten als neu
+// angekündigt, obwohl sie längst angekündigt waren — sie lagen nur bisher
+// außerhalb. Die App verschickt daraus Benachrichtigungen; das wäre ein
+// Schwall aus lauter alten Meldungen gewesen.
+const NEU_HORIZONT_MONATE = 12;
+
 function ermittleNeue(konzerte, bekannteIds) {
   // Beim allerersten Lauf gibt es keine Referenz — dann wäre alles "neu",
   // was den Tab mit tausenden Einträgen fluten würde.
   if (!bekannteIds) return [];
   const bekannt = new Set(bekannteIds);
+  const grenze = new Date();
+  grenze.setMonth(grenze.getMonth() + NEU_HORIZONT_MONATE);
+
   return konzerte
     .filter((k) => !bekannt.has(k.id))
+    .filter((k) => k.datum && new Date(k.datum) <= grenze)
     .sort((a, b) => new Date(a.datum) - new Date(b.datum))
     .slice(0, 500);
 }
