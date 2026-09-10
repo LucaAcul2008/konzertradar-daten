@@ -184,11 +184,25 @@ function liegtImLand(lat, lon, land) {
   return lat >= u.latVon && lat <= u.latBis && lon >= u.lonVon && lon <= u.lonBis;
 }
 
+/// Ab welchem Rang ein Treffer keine Ortschaft mehr ist.
+///
+/// Nominatim staffelt: Land 4, Bundesland 8, Stadt 16, Dorf 19, Stadtteil
+/// bis 22, Strasse 26, einzelnes Gebäude 30. Wir suchen Städtenamen, also
+/// ist alles über 22 der falsche Treffer. Zweite Absicherung neben
+/// `featureType=settlement` — falls der Parameter einmal ignoriert wird.
+const MAX_ORTSRANG = 22;
+
 /// Eine Abfrage. undefined = technischer Fehler, null = kein brauchbarer
 /// Treffer, sonst die Koordinaten.
 async function nominatimAbfrage(ort, laender, pruefeLand) {
+  // featureType=settlement: nur Ortschaften von der Stadt bis zum Weiler.
+  //
+  // Ohne das lieferte "Konstanz" mit AT-Filter das "Mini-Fährschiff
+  // Konstanz" — ein Modellboot im Minimundus-Park in Klagenfurt, Rang 30.
+  // Der Punkt lag brav in Österreich und bestand jede Länderprüfung.
   const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(ort)}`
-    + `&format=json&limit=1&addressdetails=1&countrycodes=${laender}`;
+    + `&format=json&limit=1&addressdetails=1&featureType=settlement`
+    + `&countrycodes=${laender}`;
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'KonzertRadar/2.0 (konzertradary@gmail.com)' },
@@ -202,6 +216,7 @@ async function nominatimAbfrage(ort, laender, pruefeLand) {
     const lat = parseFloat(j[0].lat);
     const lon = parseFloat(j[0].lon);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    if (j[0].place_rank > MAX_ORTSRANG) return null;
 
     const geliefert = ((j[0].address && j[0].address.country_code) || '').toLowerCase();
     if (pruefeLand) {
@@ -228,6 +243,7 @@ async function nominatim(ort, countryCode) {
   // Kein Treffer im eigenen Land. Das ist normal: oeticket verkauft auch
   // Karten für München und Konstanz, Eventim welche für Wien. Also noch
   // einmal ohne Länderfilter fragen, bevor der Ort als unauffindbar gilt.
+  // Genau hier wird aus dem österreichischen "Konstanz" der Bodensee.
   await new Promise((r) => setTimeout(r, 1100)); // Nominatim: 1 req/s
   return nominatimAbfrage(ort, 'at,de,ch', null);
 }
