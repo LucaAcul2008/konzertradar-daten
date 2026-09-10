@@ -54,6 +54,14 @@ jobs:
         timeout-minutes: 6
         run: npm ci
 
+      # Prueft die Koordinaten-Logik und den mitcommitteten Geo-Speicher.
+      # Laeuft ohne Netz in einer halben Sekunde. Anlass war ein Konzert in
+      # Konstanz, das mit Koordinaten aus Kaernten ausgeliefert wurde.
+      - name: Tests
+        working-directory: github_scraper
+        timeout-minutes: 2
+        run: npm test
+
       - name: Konzerte über die Eventim-API holen
         working-directory: github_scraper
         timeout-minutes: 20

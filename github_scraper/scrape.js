@@ -44,6 +44,16 @@ const MONATE_STANDARD = parseInt(process.env.MONATE_STANDARD || '6', 10);
 // Für lokale Tests: MAX_MONATE=1 node scrape.js
 const MAX_MONATE = parseInt(process.env.MAX_MONATE || '0', 10) || MONATE_VORAUS;
 const MAX_GEOCODE_PRO_LAUF = parseInt(process.env.MAX_GEOCODE || '150', 10);
+// Obergrenze für **alles** Geocoding eines Laufs.
+//
+// `ergaenzeKoordinaten` läuft viermal (zwei Quellen, je Konzerte und
+// Highlights) und hatte je 150 Abfragen frei. Bei 1,1 s Wartezeit sind das
+// schon 11 Minuten, und seit unauffindbare Orte ein zweites Mal ohne
+// Länderfilter gefragt werden, im schlimmsten Fall 22 — mehr als der
+// Watchdog bei 18 Minuten durchgehen lässt. Ein gemeinsames Zeitbudget
+// deckelt das unabhängig davon, wie oft die Funktion noch aufgerufen wird.
+const GEOCODE_BUDGET_MIN = parseInt(process.env.GEOCODE_BUDGET_MIN || '6', 10);
+const geocodeFrist = Date.now() + GEOCODE_BUDGET_MIN * 60 * 1000;
 
 // Notbremse: Ein normaler Lauf dauert ~8 Minuten. Rund ein Viertel der Läufe
 // blieb aber irgendwo hängen (vermutlich eine Chrome-Navigation, die trotz
@@ -156,10 +166,29 @@ function speichereGeoCache() {
   }
 }
 
-// Nominatim erlaubt 1 Anfrage/Sekunde — deshalb pro Lauf gedeckelt.
-async function nominatim(ort, countryCode) {
+// Grobe Umrisse der Länder, in denen wir Konzerte führen.
+//
+// Zweites Netz hinter der Länderprüfung: `countrycodes` schränkt Nominatim
+// zwar ein, aber bei einem Ortsnamen, den es im gefragten Land gar nicht
+// gibt, liefert es irgendetwas Ähnliches statt gar nichts. Genau so wurde
+// "Konstanz" mit AT-Filter zu einem Punkt vier Kilometer neben Klagenfurt.
+const LAND_UMRISS = {
+  de: { latVon: 47.2, latBis: 55.1, lonVon: 5.8, lonBis: 15.1 },
+  at: { latVon: 46.3, latBis: 49.1, lonVon: 9.5, lonBis: 17.2 },
+  ch: { latVon: 45.8, latBis: 47.9, lonVon: 5.9, lonBis: 10.6 },
+};
+
+function liegtImLand(lat, lon, land) {
+  const u = LAND_UMRISS[(land || '').toLowerCase()];
+  if (!u) return true; // unbekanntes Land: nicht ablehnen
+  return lat >= u.latVon && lat <= u.latBis && lon >= u.lonVon && lon <= u.lonBis;
+}
+
+/// Eine Abfrage. undefined = technischer Fehler, null = kein brauchbarer
+/// Treffer, sonst die Koordinaten.
+async function nominatimAbfrage(ort, laender, pruefeLand) {
   const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(ort)}`
-    + `&format=json&limit=1&countrycodes=${(countryCode || 'at,de,ch').toLowerCase()}`;
+    + `&format=json&limit=1&addressdetails=1&countrycodes=${laender}`;
   try {
     const res = await fetch(url, {
       headers: { 'User-Agent': 'KonzertRadar/2.0 (konzertradary@gmail.com)' },
@@ -169,10 +198,38 @@ async function nominatim(ort, countryCode) {
     if (!res.ok) return undefined; // technischer Fehler (z.B. Rate-Limit)
     const j = await res.json();
     if (!Array.isArray(j) || j.length === 0) return null; // nicht auffindbar
-    return { lat: parseFloat(j[0].lat), lon: parseFloat(j[0].lon) };
+
+    const lat = parseFloat(j[0].lat);
+    const lon = parseFloat(j[0].lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+
+    const geliefert = ((j[0].address && j[0].address.country_code) || '').toLowerCase();
+    if (pruefeLand) {
+      // Sagt die Antwort selbst, sie liege woanders? Dann nicht nehmen.
+      if (geliefert && geliefert !== pruefeLand) return null;
+      if (!liegtImLand(lat, lon, pruefeLand)) return null;
+    } else if (geliefert && !liegtImLand(lat, lon, geliefert)) {
+      return null;
+    }
+    return { lat, lon };
   } catch (_) {
     return undefined;
   }
+}
+
+// Nominatim erlaubt 1 Anfrage/Sekunde — deshalb pro Lauf gedeckelt.
+async function nominatim(ort, countryCode) {
+  const land = (countryCode || '').toLowerCase();
+  if (!land) return nominatimAbfrage(ort, 'at,de,ch', null);
+
+  const imLand = await nominatimAbfrage(ort, land, land);
+  if (imLand !== null) return imLand; // Treffer oder technischer Fehler
+
+  // Kein Treffer im eigenen Land. Das ist normal: oeticket verkauft auch
+  // Karten für München und Konstanz, Eventim welche für Wien. Also noch
+  // einmal ohne Länderfilter fragen, bevor der Ort als unauffindbar gilt.
+  await new Promise((r) => setTimeout(r, 1100)); // Nominatim: 1 req/s
+  return nominatimAbfrage(ort, 'at,de,ch', null);
 }
 
 // ─── Hilfsfunktionen ──────────────────────────────────────────────────────────
@@ -417,15 +474,82 @@ async function holeHighlights(quelle) {
 }
 
 // ─── Koordinaten ergänzen ─────────────────────────────────────────────────────
+/// Schlüssel im Koordinatenspeicher: Ortsname **und** Land.
+///
+/// Ohne das Land teilen sich Deutschland und Österreich einen Eintrag.
+/// "Konstanz" steht in beiden Datensätzen — 21 Konzerte in DE, 5 in AT.
+/// Der österreichische Lauf schlug es mit AT-Filter nach, bekam einen Punkt
+/// neben Klagenfurt und legte ihn unter `konstanz` ab. Danach las der
+/// deutsche Lauf denselben Eintrag: SCHILLER am Bodensee lag plötzlich im
+/// 180-km-Umkreis von Salzburg. 214 Ortsnamen kommen in beiden Ländern vor,
+/// 178 davon standen im Speicher — jeder einzelne konnte so kippen.
+function geoSchluessel(ort, land) {
+  return `${ort.toLowerCase()}|${(land || '').toLowerCase()}`;
+}
+
+/// Umriss über alle Länder, in denen wir Konzerte führen.
+function imSendegebiet(lat, lon) {
+  return lat >= 45.8 && lat <= 55.1 && lon >= 5.8 && lon <= 17.2;
+}
+
+/// Letzte Sicherung, egal woher die Koordinate stammt.
+///
+/// Zwei Fälle, in dieser Reihenfolge:
+///
+/// 1. **Vertauschte Achsen.** Die Eventim-API liefert bei einem kleinen Teil
+///    der Events `geoLocation` mit Länge und Breite in der falschen Ordnung.
+///    Gemessen am 10.09.2026: 208 von 36.986 Konzerten an 67 Orten — Bremen
+///    32-mal, Münster 27-mal. Bremen lag damit bei 8,78 Nord und 53,10 Ost,
+///    also im Indischen Ozean. Eine Verwechslung ist hier eindeutig
+///    erkennbar: Kein Längengrad des Sendegebiets (5,8–17,2) kann ein
+///    gültiger Breitengrad sein (45,8–55,1), die Bereiche überschneiden sich
+///    nicht. Also drehen statt wegwerfen.
+/// 2. **Alles andere ausserhalb.** Lieber gar keine Koordinate — dann fällt
+///    das Konzert im Umkreisfilter auf den Ortsnamen zurück, statt tausend
+///    Kilometer entfernt aufzutauchen.
+///
+/// Absichtlich **nicht** gegen das Land der Quelle geprüft: Eventim verkauft
+/// 999 Wiener Konzerte, oeticket 341 Kölner. Beides ist richtig so.
+function verwerfeUnplausible(konzerte) {
+  let gedreht = 0;
+  let verworfen = 0;
+  for (const k of konzerte) {
+    if (k.latitude == null) continue;
+    if (imSendegebiet(k.latitude, k.longitude)) continue;
+
+    if (imSendegebiet(k.longitude, k.latitude)) {
+      const lat = k.longitude;
+      k.longitude = k.latitude;
+      k.latitude = lat;
+      gedreht++;
+      continue;
+    }
+
+    console.warn(`  ! ${k.ort}: ${k.latitude},${k.longitude} — verworfen`);
+    k.latitude = null;
+    k.longitude = null;
+    verworfen++;
+  }
+  if (gedreht > 0) console.log(`  Achsen gedreht: ${gedreht}`);
+  return verworfen;
+}
+
 async function ergaenzeKoordinaten(konzerte, countryCode) {
   const ohne = konzerte.filter((k) => k.latitude == null && k.ort !== 'Ort unbekannt');
-  if (ohne.length === 0) return 0;
+  // Auch wenn nichts nachzuschlagen ist: die Koordinaten aus der API selbst
+  // sind ungeprüft und müssen durch dieselbe Kontrolle.
+  if (ohne.length === 0) {
+    verwerfeUnplausible(konzerte);
+    return konzerte.filter((k) => k.latitude != null).length;
+  }
 
   let ausTabelle = 0;
   const offen = new Set();
   for (const k of ohne) {
-    const key = k.ort.toLowerCase();
-    const treffer = BEKANNTE_STAEDTE[key] || geoCache[key];
+    const key = geoSchluessel(k.ort, countryCode);
+    // BEKANNTE_STAEDTE ist von Hand gepflegt und führt nur Großstädte, die
+    // es je nur einmal gibt — dort genügt der bloße Ortsname.
+    const treffer = BEKANNTE_STAEDTE[k.ort.toLowerCase()] || geoCache[key];
     if (treffer) {
       k.latitude = treffer.lat;
       k.longitude = treffer.lon;
@@ -440,6 +564,10 @@ async function ergaenzeKoordinaten(konzerte, countryCode) {
   let geladen = 0;
   let fehlerInFolge = 0;
   for (const ort of neu) {
+    if (Date.now() > geocodeFrist) {
+      console.warn(`  Geocoding vertagt (Zeitbudget von ${GEOCODE_BUDGET_MIN} min aufgebraucht)`);
+      break;
+    }
     await new Promise((r) => setTimeout(r, 1100)); // Nominatim: 1 req/s
     const coords = await nominatim(ort, countryCode);
     if (coords === undefined) {
@@ -451,7 +579,8 @@ async function ergaenzeKoordinaten(konzerte, countryCode) {
       continue;
     }
     fehlerInFolge = 0;
-    geoCache[ort.toLowerCase()] = coords; // null merken = nicht auffindbar
+    // null merken = nicht auffindbar
+    geoCache[geoSchluessel(ort, countryCode)] = coords;
     if (coords) geladen++;
   }
   if (neu.length > 0) speichereGeoCache();
@@ -459,17 +588,20 @@ async function ergaenzeKoordinaten(konzerte, countryCode) {
   // Frisch geladene Koordinaten eintragen
   for (const k of konzerte) {
     if (k.latitude != null) continue;
-    const treffer = geoCache[k.ort.toLowerCase()];
+    const treffer = geoCache[geoSchluessel(k.ort, countryCode)];
     if (treffer) {
       k.latitude = treffer.lat;
       k.longitude = treffer.lon;
     }
   }
 
+  const verworfen = verwerfeUnplausible(konzerte);
+
   const mitKoords = konzerte.filter((k) => k.latitude != null).length;
   console.log(
     `  Koordinaten: ${mitKoords}/${konzerte.length}`
-    + ` (Tabelle/Cache: ${ausTabelle}, neu geocodiert: ${geladen}, offen: ${offen.size - neu.length})`
+    + ` (Tabelle/Cache: ${ausTabelle}, neu geocodiert: ${geladen}, offen: ${offen.size - neu.length}`
+    + `${verworfen ? `, verworfen: ${verworfen}` : ''})`
   );
   return mitKoords;
 }
@@ -603,8 +735,22 @@ async function main() {
   process.exit(gesamtFehler > 20 ? 1 : 0);
 }
 
-main().catch(async (e) => {
-  console.error('[Scraper] Fatal:', e.message);
-  if (browser) await browser.close().catch(() => {});
-  process.exit(1);
-});
+// Nur beim direkten Aufruf loslaufen. Wird die Datei von einem Test
+// geladen, sollen bloß die Funktionen herausfallen — sonst startet jeder
+// `node --test` einen echten Scraper-Lauf.
+if (require.main === module) {
+  main().catch(async (e) => {
+    console.error('[Scraper] Fatal:', e.message);
+    if (browser) await browser.close().catch(() => {});
+    process.exit(1);
+  });
+} else {
+  module.exports = {
+    BEKANNTE_STAEDTE,
+    LAND_UMRISS,
+    geoSchluessel,
+    imSendegebiet,
+    liegtImLand,
+    verwerfeUnplausible,
+  };
+}

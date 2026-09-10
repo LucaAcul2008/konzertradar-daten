@@ -4,7 +4,8 @@
   "description": "Holt Konzerte über die Eventim-Such-API und legt sie als JSON ab",
   "main": "scrape.js",
   "scripts": {
-    "start": "node scrape.js"
+    "start": "node scrape.js",
+    "test": "node --test"
   },
   "license": "ISC",
   "dependencies": {
