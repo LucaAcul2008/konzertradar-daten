@@ -417,15 +417,16 @@ async function spotifyAusMusicbrainz(mbid) {
     if (versuch > 0) await new Promise((r) => setTimeout(r, 400 * versuch));
     try {
       const res = await fetch(url, {
-        // 30 Sekunden, nicht 10.
+        // Zwölf Sekunden.
         //
         // MusicBrainz ist nicht nur unzuverlässig, sondern manchmal
-        // schlicht langsam: Gemessen brauchte die Suche nach „Glueboys"
-        // 24 Sekunden, nach „Die Paldauer" 25. Auf dem Telefon wäre das
-        // unzumutbar — hier wartet niemand, und eine Antwort nach 25
-        // Sekunden ist unendlich viel besser als keine.
+        // schlicht langsam — gemessen brauchte eine Suche 24 Sekunden. So
+        // lange zu warten klingt grosszügig, kostet aber Durchsatz: Mit 30
+        // Sekunden Zeitlimit schaffte ein Lauf von 85 Minuten nur 333
+        // Künstler. Der Median liegt bei gut einer Sekunde; wer nach zwölf
+        // nicht geantwortet hat, kommt beim nächsten Lauf wieder dran.
         headers: { 'User-Agent': USER_AGENT },
-        signal: AbortSignal.timeout(30000),
+        signal: AbortSignal.timeout(12000),
       });
       if (res.status === 503 || res.status === 429) continue;
       if (!res.ok) return undefined;
@@ -741,10 +742,24 @@ async function main() {
   // Spotify-Profil hinterlegt. Ohne diesen Zusatz wären 350 Künstler
   // dauerhaft aussen vor gewesen. Sie kosten eine Anfrage mehr: erst den
   // Namen nachschlagen, dann die Adressen.
-  const spMbOffen = Object.values(cache)
-    .filter((e) => e && e.spotify === null && !e.spotifyMbGefragt)
-    // Die mit Kennung zuerst — sie sind halb so teuer.
-    .sort((a, b) => (b.mbid ? 1 : 0) - (a.mbid ? 1 : 0));
+  // ⚠️ **Nach Konzertzahl, nicht nach Aufwand.**
+  //
+  // Erst standen die mit MusicBrainz-Kennung vorn, weil sie halb so teuer
+  // sind. Das war falsch herum: Wer keine Kennung hat, wurde über Wikidata
+  // erkannt — und genau diese Künstler landeten damit ganz hinten. Chris
+  // Steger (15 Konzerte) und Glueboys (12) kamen nach 85 Minuten Lauf noch
+  // immer nicht an die Reihe, obwohl MusicBrainz zu Chris Steger sehr wohl
+  // ein Profil führt. Angetippt wird, wer viele Konzerte hat; also kommt
+  // der zuerst dran, koste er eine Anfrage mehr.
+  const spMbOffen = [];
+  const spGesehen = new Set();
+  for (const [schluessel, e] of [...roh.entries()].sort((a, b) => b[1].anzahl - a[1].anzahl)) {
+    const treffer = trefferZu(schluessel, e);
+    if (!treffer || treffer.spotify !== null || treffer.spotifyMbGefragt) continue;
+    if (spGesehen.has(treffer.name)) continue;
+    spGesehen.add(treffer.name);
+    spMbOffen.push(treffer);
+  }
 
   if (spMbOffen.length > 0 && Date.now() < spMbSchluss) {
     console.log(`[Künstler] Spotify über MusicBrainz: ${spMbOffen.length} offen`);
