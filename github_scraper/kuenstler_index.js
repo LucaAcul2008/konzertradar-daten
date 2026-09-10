@@ -59,6 +59,13 @@ const MAX_MB_PRO_LAUF = parseInt(process.env.MAX_MUSICBRAINZ || '700', 10);
 // geordnet aus.
 const MAX_MINUTEN = parseFloat(process.env.MAX_MINUTEN || '14');
 
+// Eigene Frist für das Nachtragen der Spotify-Kennungen über MusicBrainz.
+//
+// Muss reserviert sein: Die Namensauflösung hat einen vierstelligen
+// Rückstand und schöpft das Gesamtbudget jedes Mal aus. Vier Minuten sind
+// gut 200 Künstler je Lauf, bei vier Läufen am Tag also rund 800.
+const SPOTIFY_MB_MINUTEN = parseFloat(process.env.SPOTIFY_MB_MINUTEN || '4');
+
 // Ein Künstler kommt erst in die Datei, wenn MusicBrainz ihn kennt. Namen
 // unterhalb dieser Konzertzahl werden gar nicht erst nachgeschlagen, solange
 // noch bekanntere offen sind — die Reihenfolge macht den Rückstand nützlich,
@@ -326,6 +333,121 @@ async function wikidataStapel(namen) {
   }
 }
 
+/**
+ * Fragt die Spotify-Kennungen (Wikidata P1902) zu einem Stapel Namen ab.
+ *
+ * ⚠️ **Warum das hier passiert und nicht auf dem Telefon.** „Auf Spotify
+ * anhören" auf der Konzertseite suchte die Adresse bisher beim Antippen —
+ * über MusicBrainz, mit zwei bis drei Anfragen hintereinander. MusicBrainz
+ * wirft aber Last ab (gemessen am 10.09.2026: neun von zwölf Anfragen
+ * gelangen, zwei hingen über sechs Sekunden). Bei drei Anfragen in Folge
+ * bleibt davon wenig übrig — Luca beschrieb es als „funktioniert nur so zu
+ * 50 %". Hier oben stört keine Wartezeit, und das Ergebnis gilt für alle.
+ *
+ * Nimmt dieselben Namen wie [wikidataStapel] und liefert Name -> Kennung.
+ * undefined bei einem technischen Fehler, damit der Aufrufer den Stapel
+ * nicht als „nichts gefunden" verbucht.
+ */
+async function spotifyStapel(namen) {
+  const werte = namen
+    .flatMap((n) => ['de', 'en', 'mul'].map((t) => `"${n.replace(/["\\]/g, '')}"@${t}`))
+    .join(' ');
+
+  // Dieselbe Künstlerbedingung wie bei der Namensauflösung: Ohne sie käme
+  // zu „Wanda" auch die Wanda aus einem Film. P1902 allein reicht nicht.
+  // P434 (MusicBrainz-Kennung) kommt mit, auch wenn P1902 fehlt.
+  //
+  // Sie ist der Schlüssel für den zweiten Anlauf: Wikidata kennt nur zu
+  // gut jedem dritten Künstler eine Spotify-Kennung, MusicBrainz zu deutlich
+  // mehr. Wer über Wikidata erkannt wurde, hatte aber bisher gar keine
+  // MusicBrainz-Kennung im Cache — ohne sie liesse sich dort nicht nachfragen.
+  const query = `SELECT ?name ?spotify ?mbid WHERE {
+  VALUES ?name { ${werte} }
+  ?item rdfs:label|skos:altLabel ?name .
+  { ?item wdt:P31/wdt:P279* wd:Q215380 }
+  UNION
+  { ?item wdt:P31 wd:Q5 ; wdt:P106 ?beruf .
+    VALUES ?beruf { wd:Q639669 wd:Q177220 wd:Q36834 wd:Q488205 wd:Q753110 wd:Q855091 wd:Q486748 } }
+  OPTIONAL { ?item wdt:P1902 ?spotify }
+  OPTIONAL { ?item wdt:P434 ?mbid }
+}`;
+
+  try {
+    const res = await fetch(WIKIDATA, {
+      method: 'POST',
+      headers: {
+        'User-Agent': USER_AGENT,
+        Accept: 'application/sparql-results+json',
+        'Content-Type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ query }),
+      signal: AbortSignal.timeout(90000),
+    });
+    if (!res.ok) return undefined;
+    const j = await res.json();
+    const treffer = new Map();
+    for (const r of j.results.bindings) {
+      const n = r.name.value;
+      const vorher = treffer.get(n) || {};
+      treffer.set(n, {
+        spotify: vorher.spotify || (r.spotify ? r.spotify.value : null),
+        mbid: vorher.mbid || (r.mbid ? r.mbid.value : null),
+      });
+    }
+    return treffer;
+  } catch (_) {
+    return undefined;
+  }
+}
+
+/**
+ * Die Spotify-Adresse eines Künstlers aus MusicBrainz (url-rels).
+ *
+ * Der zweite Anlauf hinter Wikidata. Kostet eine Anfrage je Künstler und
+ * damit eine Sekunde Mindestabstand — deshalb mit eigenem Zeitbudget und
+ * über mehrere Läufe verteilt.
+ *
+ * undefined = technischer Fehler (nicht merken), null = nachgesehen, es gibt
+ * keine, sonst die Kennung.
+ */
+async function spotifyAusMusicbrainz(mbid) {
+  const url = `https://musicbrainz.org/ws/2/artist/${mbid}?inc=url-rels&fmt=json`;
+  let j = null;
+  for (let versuch = 0; versuch < 3; versuch++) {
+    if (versuch > 0) await new Promise((r) => setTimeout(r, 400 * versuch));
+    try {
+      const res = await fetch(url, {
+        // 30 Sekunden, nicht 10.
+        //
+        // MusicBrainz ist nicht nur unzuverlässig, sondern manchmal
+        // schlicht langsam: Gemessen brauchte die Suche nach „Glueboys"
+        // 24 Sekunden, nach „Die Paldauer" 25. Auf dem Telefon wäre das
+        // unzumutbar — hier wartet niemand, und eine Antwort nach 25
+        // Sekunden ist unendlich viel besser als keine.
+        headers: { 'User-Agent': USER_AGENT },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (res.status === 503 || res.status === 429) continue;
+      if (!res.ok) return undefined;
+      j = await res.json();
+      break;
+    } catch (_) { /* naechster Versuch */ }
+  }
+  if (j === null) return undefined;
+
+  try {
+    for (const r of j.relations || []) {
+      const u = r.url && r.url.resource;
+      if (!u) continue;
+      const m = u.match(/open\.spotify\.com\/artist\/([A-Za-z0-9]+)/);
+      if (m) return m[1];
+    }
+    return null;
+  } catch (_) {
+    return undefined;
+  }
+}
+
 // ─── Cache ────────────────────────────────────────────────────────────────────
 
 let cache = {};
@@ -541,6 +663,155 @@ async function main() {
     speichereCache();
   }
 
+  // ── Spotify-Kennungen, erster Anlauf: Wikidata ──────────────────────────
+  //
+  // Läuft über die bereits bestätigten Künstler, nicht über die offenen
+  // Namen: Die Kennung hängt am erkannten Künstler, nicht am Rohtitel.
+  //
+  // Ein Stapel zu 100 Namen kostet rund eine halbe Sekunde — der ganze
+  // Katalog ist in etwa einer halben Minute durch. Deshalb steht hier kein
+  // eigenes Zeitbudget, nur die gemeinsame Frist.
+  //
+  // `spotify: null` heisst „gefragt, Wikidata kennt keine". Ohne diesen
+  // Vermerk fragte jeder Lauf dieselben aussichtslosen Namen wieder.
+  const spotifyOffen = [...new Set(
+    [...roh.entries()]
+      .map(([schluessel, e]) => trefferZu(schluessel, e))
+      .filter((t) => t && t.spotify === undefined)
+      .map((t) => t.name)
+  )];
+
+  if (spotifyOffen.length > 0) {
+    console.log(`[Künstler] Spotify: ${spotifyOffen.length} Namen offen`);
+    let spGefunden = 0;
+    let spFehler = 0;
+
+    for (let i = 0; i < spotifyOffen.length; i += WD_PRO_STAPEL) {
+      if (Date.now() > schluss) {
+        console.log('[Künstler] Spotify: Zeitbudget erreicht, Rest beim nächsten Lauf');
+        break;
+      }
+      const teil = spotifyOffen.slice(i, i + WD_PRO_STAPEL);
+      const treffer = await spotifyStapel(teil);
+
+      if (treffer === undefined) {
+        if (++spFehler >= 5) {
+          console.warn('[Künstler] Spotify: Wikidata antwortet nicht — abgebrochen');
+          break;
+        }
+        continue;
+      }
+      spFehler = 0;
+
+      // Der Cache ist nach Rohtitel geschlüsselt, die Antwort nach
+      // kanonischem Namen — deshalb über alle Einträge mit diesem Namen.
+      for (const eintrag of Object.values(cache)) {
+        if (!eintrag || eintrag.spotify !== undefined) continue;
+        if (!teil.includes(eintrag.name)) continue;
+        const t = treffer.get(eintrag.name);
+        if (!t) { eintrag.spotify = null; continue; }
+        eintrag.spotify = t.spotify || null;
+        // Die MusicBrainz-Kennung nur ergänzen, nie überschreiben.
+        if (!eintrag.mbid && t.mbid) eintrag.mbid = t.mbid;
+        if (t.spotify) spGefunden++;
+      }
+    }
+
+    console.log(`[Künstler] Spotify: ${spGefunden} Kennungen gefunden`);
+    speichereCache();
+  }
+
+
+  // ── Spotify-Kennungen, zweiter Anlauf: MusicBrainz ──────────────────────
+  //
+  // Wikidata kennt nur zu gut jedem dritten Künstler eine Spotify-Kennung.
+  // Eine Stichprobe von 40 Künstlern über MusicBrainz ergab dagegen 24
+  // Treffer — die beiden Quellen ergänzen einander (die Kastelruther Spatzen
+  // stehen nur bei Wikidata, Hubert von Goisern bei keiner von beiden).
+  //
+  // Eigenes Zeitbudget, und **vor** der Namensauflösung: Sonst käme dieser
+  // Durchgang nie dran. Der Rückstand offener Namen ist vierstellig, und die
+  // Namensauflösung schöpft die Frist jedes Mal voll aus.
+  const spMbSchluss = Math.min(schluss, Date.now() + SPOTIFY_MB_MINUTEN * 60 * 1000);
+  // Auch die ohne MusicBrainz-Kennung.
+  //
+  // Wer über Wikidata erkannt wurde, hat oft keine — Wikidata führt P434
+  // längst nicht überall. Chris Steger und Glueboys stehen genau so im
+  // Speicher, und bei Chris Steger ist bei MusicBrainz sehr wohl ein
+  // Spotify-Profil hinterlegt. Ohne diesen Zusatz wären 350 Künstler
+  // dauerhaft aussen vor gewesen. Sie kosten eine Anfrage mehr: erst den
+  // Namen nachschlagen, dann die Adressen.
+  const spMbOffen = Object.values(cache)
+    .filter((e) => e && e.spotify === null && !e.spotifyMbGefragt)
+    // Die mit Kennung zuerst — sie sind halb so teuer.
+    .sort((a, b) => (b.mbid ? 1 : 0) - (a.mbid ? 1 : 0));
+
+  if (spMbOffen.length > 0 && Date.now() < spMbSchluss) {
+    console.log(`[Künstler] Spotify über MusicBrainz: ${spMbOffen.length} offen`);
+    let mbGefunden = 0;
+    let mbFehler = 0;
+    let seitLetzterSicherung = 0;
+
+    for (const eintrag of spMbOffen) {
+      if (Date.now() > spMbSchluss) {
+        console.log('[Künstler] Spotify/MusicBrainz: Zeitbudget erreicht');
+        break;
+      }
+      // Kennung fehlt? Erst den Künstler suchen.
+      if (!eintrag.mbid) {
+        await new Promise((r) => setTimeout(r, 1100));
+        const gefunden = await musicbrainz(eintrag.name);
+        if (gefunden === undefined) {
+          if (++mbFehler >= 8) {
+            console.warn('[Künstler] Spotify/MusicBrainz: zu viele Fehler — abgebrochen');
+            break;
+          }
+          continue;
+        }
+        if (gefunden === null) {
+          // MusicBrainz kennt den Namen nicht — dann gibt es dort auch
+          // keine Adresse. Nicht wieder fragen.
+          eintrag.spotifyMbGefragt = true;
+          mbFehler = 0;
+          continue;
+        }
+        eintrag.mbid = gefunden.mbid;
+        if (!eintrag.land && gefunden.land) eintrag.land = gefunden.land;
+      }
+
+      await new Promise((r) => setTimeout(r, 1100)); // 1 Anfrage/Sekunde
+      const id = await spotifyAusMusicbrainz(eintrag.mbid);
+      if (id === undefined) {
+        if (++mbFehler >= 8) {
+          console.warn('[Künstler] Spotify/MusicBrainz: zu viele Fehler — abgebrochen');
+          break;
+        }
+        continue;
+      }
+      mbFehler = 0;
+      // Gefragt haben wir so oder so — sonst fragt der nächste Lauf wieder.
+      eintrag.spotifyMbGefragt = true;
+      if (id) {
+        eintrag.spotify = id;
+        mbGefunden++;
+      }
+
+      // Zwischendurch sichern.
+      //
+      // Dieser Durchgang läuft minutenlang, und der Job hat ein hartes
+      // Zeitlimit. Würde erst am Ende geschrieben, ginge bei einem Abbruch
+      // die ganze Arbeit verloren — und beim nächsten Lauf begänne dieselbe
+      // Sekundenzählerei von vorn.
+      if (++seitLetzterSicherung >= 25) {
+        seitLetzterSicherung = 0;
+        speichereCache();
+      }
+    }
+
+    console.log(`[Künstler] Spotify über MusicBrainz: ${mbGefunden} Kennungen gefunden`);
+    speichereCache();
+  }
+
   // ── Zweiter Durchgang: MusicBrainz, Name für Name ────────────────────────
   //
   // Offene Namen nach Konzertzahl: die bekanntesten zuerst, damit die Datei
@@ -617,16 +888,25 @@ async function main() {
       vorhanden.k += e.anzahl;
       if (!vorhanden.b && e.bild) vorhanden.b = e.bild;
       if (!vorhanden.l && treffer.land) vorhanden.l = treffer.land;
+      if (!vorhanden.s && treffer.spotify) vorhanden.s = treffer.spotify;
     } else {
       // Die MusicBrainz-ID steht bewusst NICHT in der ausgelieferten Datei:
       // Die App braucht sie nicht, und 36 Zeichen mal mehrere tausend Künstler
       // sind gut 200 kB, die jedes Gerät sonst mitlädt. Im Cache hier im Repo
       // bleibt sie erhalten, falls sie später gebraucht wird.
+      //
+      // Die Spotify-Kennung dagegen schon: 22 Zeichen, und nur gut die
+      // Hälfte der Künstler hat eine — rund 40 kB auf eine Datei von 345.
+      // Dafür muss die App beim Antippen von „Auf Spotify anhören" gar
+      // nichts mehr nachschlagen. Das ist der Unterschied zwischen einem
+      // Link, der beim Künstler landet, und einem, der auf der Suchseite
+      // endet, weil MusicBrainz gerade Last abwirft.
       zusammen.set(key, {
         n: treffer.name,      // kanonische Schreibweise der Quelle
         k: e.anzahl,          // angekündigte Konzerte
         b: e.bild || undefined,
         l: treffer.land || undefined,
+        s: treffer.spotify || undefined,
       });
     }
   }
