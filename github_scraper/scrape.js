@@ -88,6 +88,18 @@ const QUELLEN = [
     countryCode: 'AT',
     referer: 'https://www.oeticket.com/',
   },
+  // Ticketcorner gehört zu Eventim und hängt an derselben Schnittstelle.
+  // Die Oberkategorie heisst dort aber "Musik", nicht "Konzerte" — mit
+  // "Konzerte" kommen null Treffer (geprüft am 28.09.2026: 3.021 mit "Musik").
+  // Die Unterkategorien schreiben sich mit Punkt: "Rock.Pop", "Hip-Hop.Rap".
+  {
+    key: 'ticketcorner_ch',
+    webId: 'web__ticketcorner-ch',
+    quelle: 'Ticketcorner',
+    countryCode: 'CH',
+    referer: 'https://www.ticketcorner.ch/',
+    kategorie: 'Musik',
+  },
 ];
 
 // ─── Koordinaten-Fallback ─────────────────────────────────────────────────────
@@ -115,6 +127,19 @@ const BEKANNTE_STAEDTE = {
   dortmund: { lat: 51.5136, lon: 7.4653 },
   essen: { lat: 51.4556, lon: 7.0116 },
   bremen: { lat: 53.0793, lon: 8.8017 },
+  // Schweiz — nur Namen, die es sonst nirgends gibt
+  zürich: { lat: 47.3769, lon: 8.5417 },
+  basel: { lat: 47.5596, lon: 7.5886 },
+  bern: { lat: 46.9481, lon: 7.4474 },
+  genf: { lat: 46.2044, lon: 6.1432 },
+  lausanne: { lat: 46.5197, lon: 6.6323 },
+  luzern: { lat: 47.0502, lon: 8.3093 },
+  winterthur: { lat: 47.4988, lon: 8.7237 },
+  'st. gallen': { lat: 47.4245, lon: 9.3767 },
+  lugano: { lat: 46.0037, lon: 8.9511 },
+  aarau: { lat: 47.3925, lon: 8.0442 },
+  solothurn: { lat: 47.2088, lon: 7.5323 },
+  zug: { lat: 47.1662, lon: 8.5155 },
   hannover: { lat: 52.3759, lon: 9.732 },
   nürnberg: { lat: 49.4521, lon: 11.0767 },
   leipzig: { lat: 51.3397, lon: 12.3731 },
@@ -269,7 +294,8 @@ const ZUSATZPAKET = new RegExp(
     'hotel[-\\w\\s]*|meet\\s*&\\s*greet[-\\w\\s]*|suiten-?ticket[-\\w\\s]*|' +
     'komfort-?(ticket|upgrade)[-\\w\\s]*|logen?[-\\w\\s]*|business\\s*seat[-\\w\\s]*|' +
     '[-\\w\\s]*upgrade|[-\\w\\s]*ticket\\s*package|[-\\w\\s]*paket' +
-  ')\\s*[-|]\\s+',
+  // Ticketcorner trennt mit Doppelpunkt: "VIP: Rod Stewart + Special Guest".
+  ')\\s*[-|:]\\s+',
   'i'
 );
 
@@ -307,14 +333,34 @@ const GENRE_ALIAS = {
   'klassische konzerte': 'Klassik',
   'weitere konzerte': 'Sonstiges',
   'mehr konzerte': 'Sonstiges',
+  // Ticketcorner, nach dem Ersetzen von "." durch " & " (siehe ermittleGenre)
+  'hip-hop & rap': 'HipHop & Rap',
+  'jazz & blues & funk': 'Jazz & Blues',
+  'heavy metal': 'Hard & Heavy',
+  'alternativ': 'Rock & Pop',
+  'volksmusik': 'Schlager & Volksmusik',
+  'schlager': 'Schlager & Volksmusik',
+  'party': 'Party & Feste',
+  'techno & trance': 'Electronic & Dance',
+  'house & electro': 'Electronic & Dance',
+  'open air': 'Festivals',
+  'klassik': 'Klassik',
+  'latin': 'Sonstiges',
+  'folklore & gospel': 'Sonstiges',
+  'weitere': 'Sonstiges',
+  'specials': 'Sonstiges',
 };
 
-function ermittleGenre(categories) {
+// Bei Ticketcorner stehen VIP- und Hospitality-Pakete als eigene Unterkategorie.
+const PAKET_KATEGORIE = /vip-tickets|hospitality/i;
+
+function ermittleGenre(categories, oberkategorie = 'Konzerte') {
   const subs = (categories || [])
-    .filter((c) => c.parentCategory && c.parentCategory.name === 'Konzerte')
+    .filter((c) => c.parentCategory && c.parentCategory.name === oberkategorie)
     .map((c) => c.name);
   for (const s of subs) {
-    const treffer = GENRE_ALIAS[s.toLowerCase().trim()];
+    const schluessel = s.toLowerCase().trim().replace(/\./g, ' & ');
+    const treffer = GENRE_ALIAS[schluessel];
     // "Sonstiges" nur nehmen, wenn nichts Konkreteres dabei ist
     if (treffer && treffer !== 'Sonstiges') return treffer;
   }
@@ -376,7 +422,7 @@ function baueUrl(quelle, params) {
     webId: quelle.webId,
     language: 'de',
     retail_partner: 'EVE',
-    categories: 'Konzerte',
+    categories: quelle.kategorie || 'Konzerte',
     page_size: String(PAGE_SIZE),
     ...params,
   });
@@ -392,6 +438,7 @@ function mapProdukt(p, quelle) {
   if (p.status === 'Cancelled' || p.status === 'SoldOut') return null;
   // Ticket-Zusatzpakete sind Dubletten des eigentlichen Konzerts
   if (istZusatzpaket(p.name)) return null;
+  if ((p.categories || []).some((c) => PAKET_KATEGORIE.test(c.name || ''))) return null;
   // Das Monatsfenster beginnt am Monatsersten — bereits gelaufene Termine
   // deshalb aussortieren. Mehrtägiges (Festivals) zählt bis zum Enddatum.
   const ende = le.endDate || le.startDate;
@@ -416,7 +463,7 @@ function mapProdukt(p, quelle) {
   }
   const venue = (loc.name || '').trim();
   if (venue) k.venue = venue;
-  const genre = ermittleGenre(p.categories);
+  const genre = ermittleGenre(p.categories, quelle.kategorie || 'Konzerte');
   if (genre) k.genre = genre;
   return k;
 }
@@ -690,13 +737,17 @@ async function main() {
   let gesamtFehler = 0;
   let gesamtKonzerte = 0;
 
-  for (const quelle of QUELLEN) {
+  // Für lokale Tests: NUR_QUELLE=ticketcorner_ch node scrape.js
+  const nur = process.env.NUR_QUELLE;
+  for (const quelle of QUELLEN.filter((q) => !nur || q.key === nur)) {
     const { konzerte, fehler } = await holeQuelle(quelle);
     gesamtFehler += fehler;
 
     if (konzerte.length === 0) {
       console.error(`[FEHLER] ${quelle.quelle}: 0 Konzerte — Datei wird NICHT überschrieben`);
-      gesamtFehler += 10;
+      // Die Schweiz ist neu und klein. Fällt sie aus, soll das nicht den
+      // ganzen Lauf rot machen und Österreich und Deutschland mitreissen.
+      gesamtFehler += quelle.kategorie ? 1 : 10;
       continue;
     }
 

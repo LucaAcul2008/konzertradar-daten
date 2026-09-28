@@ -522,7 +522,7 @@ async function main() {
   const roh = new Map(); // kandidat -> { anzahl, bild }
   let konzerteGesamt = 0;
 
-  for (const datei of ['eventim_de_full.json', 'oeticket_at_full.json']) {
+  for (const datei of ['eventim_de_full.json', 'oeticket_at_full.json', 'ticketcorner_ch_full.json']) {
     const p = path.join(DATA_DIR, datei);
     if (!fs.existsSync(p)) {
       console.warn(`[Künstler] ${datei} fehlt — übersprungen`);

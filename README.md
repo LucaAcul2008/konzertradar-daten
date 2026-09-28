@@ -32,6 +32,8 @@ Basis-URL: `https://lucaacul2008.github.io/konzertradar-daten/`
 | `eventim_de_full.json` | Deutschland, 12 Monate |
 | `oeticket_at.json` | Österreich, nächste 6 Monate |
 | `oeticket_at_full.json` | Österreich, 12 Monate |
+| `ticketcorner_ch.json` | Schweiz (Ticketcorner, Kategorie „Musik"), nächste 6 Monate |
+| `ticketcorner_ch_full.json` | Schweiz, 24 Monate |
 | `*_highlights.json` | Von der Plattform empfohlene Konzerte |
 | `*_ticketalarm.json` | Seit dem letzten Lauf neu angekündigt |
 | `bekannte_ids.json` | Referenz, um neue Konzerte zu erkennen |
