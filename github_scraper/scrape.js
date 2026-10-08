@@ -299,8 +299,16 @@ const ZUSATZPAKET = new RegExp(
   'i'
 );
 
+// Dasselbe hinten: "Enkay - Meet & Greet Upgrade", "X - VIP Upgrade".
+// Nur Upgrades — sie setzen ein normales Ticket voraus und sind kein
+// eigener Eintritt. "VIP Package" oder "Burg VIP Ticket" dagegen sind echte
+// Tickets; die fasst die App als Varianten eines Abends zusammen.
+// Gefunden am 06.10.2026, als die App „Enkay - Meet & Greet Upgrade" als
+// neues Konzert meldete.
+const UPGRADE_HINTEN = /[-|:–]\s*[^-|:–]*\bupgrade\s*$/i;
+
 function istZusatzpaket(name) {
-  return ZUSATZPAKET.test(name || '');
+  return ZUSATZPAKET.test(name || '') || UPGRADE_HINTEN.test(name || '');
 }
 
 // Inhaltlicher Schlüssel: dasselbe Konzert kann unter mehreren productIds
@@ -700,6 +708,57 @@ async function ladeBekannteIds() {
 // Schwall aus lauter alten Meldungen gewesen.
 const NEU_HORIZONT_MONATE = 12;
 
+// Wie lange ein Konzert als „neu angekündigt" in der Liste bleibt.
+//
+// Vorher stand dort nur, was seit dem letzten Lauf dazukam — sechs Stunden.
+// Die App fragt im Hintergrund aber nicht pünktlich: Android verschiebt und
+// überspringt Läufe, und alles, was dazwischen angekündigt wurde, war für
+// die Benachrichtigungen verloren. Mit sieben Tagen holt die App das beim
+// nächsten Lauf nach; was schon gemeldet ist, merkt sie sich selbst.
+// Der Tab „Bald verfügbar" zeigt damit auch eine Woche statt sechs Stunden.
+const NEU_FENSTER_TAGE = 7;
+
+/// Lädt die Liste des letzten Laufs, um sie fortzuschreiben.
+async function ladeLetzteNeue(key) {
+  if (!PAGES_URL) return [];
+  try {
+    const res = await fetch(`${PAGES_URL}/${key}_ticketalarm.json`, {
+      signal: AbortSignal.timeout(20000),
+    });
+    if (!res.ok) return [];
+    const j = await res.json();
+    return Array.isArray(j) ? j : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+/// Neue dieses Laufs plus die der letzten Tage, die es noch gibt.
+///
+/// Jeder Eintrag trägt `neuSeit`. Ältere Listen ohne das Feld zählen als
+/// vom letzten Lauf. Was der Katalog nicht mehr führt (abgesagt,
+/// ausverkauft, vorbei), fällt heraus — sonst würde die App es melden.
+function fortschreiben(neue, letzte, konzerte, jetzt = new Date()) {
+  const aktuell = new Map(konzerte.map((k) => [k.id, k]));
+  const grenze = jetzt.getTime() - NEU_FENSTER_TAGE * 24 * 3600 * 1000;
+  const vorher = new Date(jetzt.getTime() - 6 * 3600 * 1000).toISOString();
+  const raus = new Map();
+  for (const k of neue) raus.set(k.id, { ...k, neuSeit: jetzt.toISOString() });
+  for (const alt of letzte) {
+    if (!alt || !alt.id || raus.has(alt.id)) continue;
+    const seit = alt.neuSeit || vorher;
+    if (new Date(seit).getTime() < grenze) continue;
+    const frisch = aktuell.get(alt.id);
+    if (!frisch) continue;
+    // Die aktuellen Daten nehmen (Koordinaten, Bild), das Datum der
+    // Ankündigung behalten.
+    raus.set(alt.id, { ...frisch, neuSeit: seit });
+  }
+  return [...raus.values()]
+    .sort((a, b) => new Date(a.datum) - new Date(b.datum))
+    .slice(0, 1500);
+}
+
 function ermittleNeue(konzerte, bekannteIds) {
   // Beim allerersten Lauf gibt es keine Referenz — dann wäre alles "neu",
   // was den Tab mit tausenden Einträgen fluten würde.
@@ -771,7 +830,8 @@ async function main() {
 
     // Seit dem letzten Lauf neu dazugekommene Konzerte → "Bald erhältlich"
     const neue = ermittleNeue(konzerte, bekannteIds?.[quelle.key]);
-    schreibe(`${quelle.key}_ticketalarm.json`, neue);
+    const neueWoche = fortschreiben(neue, await ladeLetzteNeue(quelle.key), konzerte);
+    schreibe(`${quelle.key}_ticketalarm.json`, neueWoche);
     alleIds[quelle.key] = konzerte.map((k) => k.id);
 
     index.quellen[quelle.key] = {
@@ -781,6 +841,7 @@ async function main() {
       konzerteFull: konzerte.length,
       highlights: highlights.length,
       neuAngekuendigt: neue.length,
+      neuAngekuendigtWoche: neueWoche.length,
       mitKoordinaten: konzerte.filter((k) => k.latitude != null).length,
     };
     gesamtKonzerte += konzerte.length;
@@ -813,6 +874,8 @@ if (require.main === module) {
   });
 } else {
   module.exports = {
+    fortschreiben,
+    istZusatzpaket,
     BEKANNTE_STAEDTE,
     LAND_UMRISS,
     geoSchluessel,
