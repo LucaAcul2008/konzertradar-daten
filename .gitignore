@@ -1,4 +1,7 @@
 node_modules/
 
 # Scraper-Ergebnis: wird nach gh-pages veröffentlicht, nicht in die History
-data/
+data/*
+# Ausnahme: von Hand gepflegt, geht mit den Daten nach gh-pages. Die App
+# liest daraus die AWIN-Kennungen (lib/partner_kennung.dart im App-Repo).
+!data/partner.json
